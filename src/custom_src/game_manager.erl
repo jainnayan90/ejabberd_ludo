@@ -1,0 +1,149 @@
+%%%-------------------------------------------------------------------
+%%% @author Nayan Jain <nayanjain>
+%%% @copyright (C) 2020, Nayan Jain
+%%% @doc
+%%%
+%%% @end
+%%% Created :  9 Feb 2020 by Nayan Jain <nayanjain>
+%%%-------------------------------------------------------------------
+-module(game_manager).
+
+-behaviour(supervisor).
+
+
+-include("logger.hrl").
+-include("mygame.hrl").
+-include("xmpp.hrl").
+%% API
+-export([start_link/0, make_users_play/3, close_table/1, open_table/4, send_to_game/1, get_active_game/1]).
+
+%% Supervisor callbacks
+-export([init/1]).
+
+-define(SERVER, ?MODULE).
+
+-record(tables, {id, pid, sid, node, type}).
+
+-record(counter, {tableId, id}).
+%%%===================================================================
+%%% API functions
+%%%===================================================================
+
+%%--------------------------------------------------------------------
+%% @doc
+%% Starts the supervisor
+%% @end
+%%--------------------------------------------------------------------
+start_link() ->
+    ?WARNING_MSG("~n~n~n in game manager start link ********************* ~n~n~n", []),
+    supervisor:start_link({local, ?SERVER}, ?MODULE, []).
+
+%%%===================================================================
+%%% Supervisor callbacks
+%%%===================================================================
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc
+%% Whenever a supervisor is started using supervisor:start_link/[2,3],
+%% this function is called by the new process to find out about
+%% restart strategy, maximum restart intensity, and child
+%% specifications.
+%% @end
+%%--------------------------------------------------------------------
+init([]) ->
+    
+    mnesia:create_table(tables, [{ram_copies, [node()]},
+				{attributes, record_info(fields, tables)}]),
+    mnesia:add_table_index(tables, pid),
+    mnesia:add_table_index(tables, node),
+    mnesia:add_table_copy(tables, node(), ram_copies),
+    
+    
+    mnesia:create_table(counter, [{ram_copies, [node()]},
+				  {attributes, record_info(fields, counter)}]),
+    
+    fix_stale_records(),
+    
+    
+    SupFlags = #{strategy => simple_one_for_one,
+		 intensity => 10,
+		 period => 1},
+    
+    AChild = #{id => game_table,
+	       start => {game_table, start_link, []},
+	       restart => temporary,
+	       shutdown => 5000,
+	       type => worker,
+	       modules => [game_table]},
+    
+    {ok, {SupFlags, [AChild]}}.
+
+%%%===================================================================
+%%% Internal functions
+%%%===================================================================
+open_table(ID, PID, SID, Type) ->
+    F = fun() ->
+                mnesia:write(#tables{
+                                id = ID,
+                                pid = PID,
+                                sid = SID,
+                                type = Type,
+                                node=node()
+                               })
+        end,
+    mnesia:sync_dirty(F).
+
+
+make_users_play(Players, Level, Chips) ->
+    F = fun() ->
+		mnesia:dirty_update_counter(counter, ?TABLE_COUNTER, 1)
+	end,
+    Id =  integer_to_list(mnesia:sync_dirty(F)),
+    Node = lists:nth(2, string:split(atom_to_list(node()), "@")),
+    Id1 = list_to_binary(Id ++ "_" ++ Node ++ "@" ++ binary_to_list(?GAME_ROUTE)),
+    Res = supervisor:start_child(?MODULE, [[Players, Id1, Level, Chips]]).
+
+close_table(ID) ->
+    F = fun() ->
+                mnesia:delete({tables, ID})
+        end,
+    mnesia:sync_dirty(F).
+
+fix_stale_records() ->
+    Node = node(),
+    Pattern = #tables{node=Node, _='_'},
+    Recs = mnesia:dirty_match_object(Pattern),
+    lists:map(fun(Rec)-> 
+                      close_table(Rec#tables.id)
+              end, Recs),
+    F = fun() ->
+		mnesia:delete({counter, ?TABLE_COUNTER})
+	end,
+    mnesia:sync_dirty(F).
+
+
+send_to_game({Type, Stanza, SubEl}) ->
+    GameId = jid:to_string(xmpp:get_to(Stanza)),
+    Pattern = #tables{id= GameId, _='_'},
+    Recs = mnesia:dirty_match_object(Pattern),
+    ?WARNING_MSG("~n~n~n in game managerrrrrrrrrrrrrr ~p~n~n~n~n", [{GameId, Recs}]),
+    if Recs =/= [] ->
+	    lists:map(fun(Rec)->
+			      gen_server:cast(Rec#tables.pid, {Type, Stanza, SubEl})
+		      end, Recs);
+       true  ->
+	    game_utils:send_error_stanza(Stanza, #xmlel{name = <<"error">>, attrs = [], children = [{xmlcdata, <<"Error! Game Id.">>}]})
+    end.
+
+get_active_game({Stanza, SubEl}) ->
+    Sender = jid:to_string(xmpp:get_from(Stanza)),
+    Key = <<Sender/binary, ?ACTIVE_GAME_KEY/binary>>,
+    GameId = eredis_pooler:q(?REDIS_POOL, ["GET", Key]),
+    case GameId of 
+	{ok, ActiveGame} when ActiveGame =/= undefined ->
+	    ActiveGame;
+	_ ->
+	    <<"null">>
+    end.
+	    

@@ -1,0 +1,745 @@
+%%%-----------------------------A--------------------------------------
+%%% @author Nayan Jain <nayanjain>
+%%% @copyright (C) 2020, Nayan Jain
+%%% @doc
+%%%
+%%% @end
+%%% Created :  9 Feb 2020 by Nayan Jain <nayanjain>
+%%%-------------------------------------------------------------------
+-module(game_table).
+
+-behaviour(gen_server).
+
+
+
+-include("logger.hrl").
+-include("xmpp.hrl").
+-include("mygame.hrl").
+-include("namespaces.hrl").
+%% API
+-export([start_link/1]).
+
+%% gen_server callbacks
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2,
+	 terminate/2, code_change/3, format_status/2]).
+
+-define(SERVER, ?MODULE).
+
+-record(state, {id, level, players, current_turn, timer_expire_time, game_state, current_dice_val, winner_id, pot_amount=0}).
+
+%%%===================================================================
+%%% API
+%%%===================================================================
+
+%%--------------------------------------------------------------------
+%% @doc
+%% Starts the server
+%% @end
+%%--------------------------------------------------------------------
+start_link(Opts) ->
+    ?WARNING_MSG("in game table start link 5555555 ~p~n~n~n" , [Opts]),
+    gen_server:start_link(?MODULE, Opts, []).
+
+%%%===================================================================
+%%% gen_server callbacks
+%%%===================================================================
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc
+%% Initializes the server
+%% @end
+%%--------------------------------------------------------------------
+-spec init(Args :: term()) -> {ok, State :: term()} |
+	  {ok, State :: term(), Timeout :: timeout()} |
+	  {ok, State :: term(), hibernate} |
+	  {stop, Reason :: term()} |
+	  ignore.
+init([Players, Id, Level, Chips]) ->
+    SID={os:timestamp(), self()},
+    random:seed(os:timestamp()),
+    game_manager:open_table(Id, self(), SID, custom),
+    if(length(Players) == 2) ->
+	    Indexes = [1, 3];
+      true ->
+	    Indexes = [1, 2, 3, 4]
+    end,
+    NewPlayers = lists:foldl(fun(Ind, AccIn) -> 
+				     Player = lists:nth(Ind, Players),
+				     PlayerInd = lists:nth(Ind, Indexes),
+				     {_, Key, Delta} = lists:keyfind(PlayerInd, 1, ?INDEX_KEY),
+				     PlayerChips = Player#player.chips,
+				     Markers = lists:map(fun(Ind) ->
+								 {<<Key/binary, Ind/binary>>, 0}
+							 end, [<<"1">>, <<"2">>, <<"3">>, <<"4">>]),
+				     AccIn ++ [Player#player{index=PlayerInd, delta=Delta, markers=Markers, remaining_chips=PlayerChips - Chips}]
+			     end, [], lists:seq(1, length(Players))),
+    set_redis_active_game(NewPlayers, Id),
+    CurrentPlayer = lists:nth(1, NewPlayers),
+    PotAmount = length(NewPlayers) * Chips,
+    {ok, #state{id=Id, level=Level, pot_amount=PotAmount, players=NewPlayers, game_state='send_game_info', current_turn=CurrentPlayer#player.id, timer_expire_time=game_utils:timer_expire_time(?GAME_START_TIME)}, ?GAME_START_TIME}.
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc
+%% Handling call messages
+%% @end
+%%--------------------------------------------------------------------
+-spec handle_call(Request :: term(), From :: {pid(), term()}, State :: term()) ->
+	  {reply, Reply :: term(), NewState :: term()} |
+	  {reply, Reply :: term(), NewState :: term(), Timeout :: timeout()} |
+	  {reply, Reply :: term(), NewState :: term(), hibernate} |
+	  {noreply, NewState :: term()} |
+	  {noreply, NewState :: term(), Timeout :: timeout()} |
+	  {noreply, NewState :: term(), hibernate} |
+	  {stop, Reason :: term(), Reply :: term(), NewState :: term()} |
+	  {stop, Reason :: term(), NewState :: term()}.
+handle_call(Request, From, State) ->
+    Reply = ok,
+    NewState = my_handle_call(Request, From, State),
+    Timeout = game_utils:calculate_timeout(State#state.timer_expire_time),
+    TimerTime = game_utils:timer_expire_time(Timeout),
+    {reply, Reply, State#state{timer_expire_time=TimerTime}, Timeout}.
+
+my_handle_call(_request, _From, State) ->
+    State.
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc
+%% Handling cast messages
+%% @end
+%%--------------------------------------------------------------------
+-spec handle_cast(Request :: term(), State :: term()) ->
+	  {noreply, NewState :: term()} |
+	  {noreply, NewState :: term(), Timeout :: timeout()} |
+	  {noreply, NewState :: term(), hibernate} |
+	  {stop, Reason :: term(), NewState :: term()}.
+handle_cast(Request, State) ->
+    {NewState, Timeout} = my_handle_cast(Request, State),
+    TimerTime = game_utils:timer_expire_time(Timeout),
+    {M, S, _Ms} = os:timestamp(),
+    CT  =M * 1000000 + S*1000,
+    ?WARNING_MSG("~n~n~n~n~n printing timeout diff in cast  ~p ~n~n~n~n", [{TimerTime, CT, game_utils:calculate_timeout(TimerTime)}]),
+    {noreply, NewState#state{timer_expire_time=TimerTime}, Timeout}.
+
+my_handle_cast({player_quit, Stanza, SubEl}, State) ->
+    Sender = jid:to_string(xmpp:get_from(Stanza)),
+    case lists:keyfind(Sender, #player.id, State#state.players) of
+	false ->
+	    NewState = State,
+	    Timeout =  game_utils:calculate_timeout(State#state.timer_expire_time),
+	    game_utils:send_error_stanza(Stanza, #xmlel{name = <<"error">>, attrs = [], children = [{xmlcdata, <<"Error! Invalid Stanza.">>}]});
+	Player ->
+	    game_utils:send_result_stanza(Stanza),
+	    delete_redis_active_game([lists:keyfind(Sender, #player.id, State#state.players)]),
+	    Players = lists:filter(fun(PL) -> 
+					   PL#player.id =/= Sender
+				   end, State#state.players),
+	    if length(Players) > 1 ->
+		    LeavePlayer = lists:keyfind(Sender, #player.id, State#state.players),
+		    game_queries:update_user_chips(?LSERVER, LeavePlayer#player.jid, LeavePlayer#player.chips, LeavePlayer#player.remaining_chips, LeavePlayer#player.level),
+		    PlayerIdEl = #xmlel{name = <<"player_id">>, attrs = [], children = [{xmlcdata, Sender}]},
+		    PlayerIndexEl = #xmlel{name = <<"player_index">>, attrs = [], children = [{xmlcdata, integer_to_binary(LeavePlayer#player.index)}]},
+		    FromJID = game_utils:make_jid(State#state.id),
+		    QueryEl = #xmlel{name = <<"query">>, attrs = [], children = [PlayerIdEl, PlayerIndexEl]},
+		    QueryEl1 = game_utils:set_namespace(QueryEl, ?NS_QUIT_GAME),
+		    Id = game_utils:get_iq_id(FromJID, ?NS_QUIT_GAME),
+		    
+		    if (State#state.current_turn == LeavePlayer#player.id) ->
+			    NextTurnID = get_next_player(State),
+			    NewState = State#state{players=Players, current_turn=NextTurnID, game_state='player_turn'},
+                            Timeout =  0;
+		       true ->
+			    NewState = State#state{players=Players},
+			    Timeout =  game_utils:calculate_timeout(State#state.timer_expire_time)
+		    end,
+		    game_utils:broadcast_stanza(Players, Id, FromJID, 'set', [QueryEl1]);
+	       true ->
+		    Winner = lists:nth(1, Players),
+		    NewState = State#state{players=Players, game_state='declare_result', winner_id=Winner#player.id},
+		    Timeout = 0
+	    end
+    end,
+    {NewState, Timeout};
+
+
+my_handle_cast({send_game_info, Stanza, SubEl}, State) ->
+    Sender = jid:to_string(xmpp:get_from(Stanza)),
+    case lists:keyfind(Sender, #player.id, State#state.players) of
+	false ->
+	    NewState = State,
+	    Timeout =  game_utils:calculate_timeout(State#state.timer_expire_time),
+	    game_utils:send_error_stanza(Stanza, #xmlel{name = <<"error">>, attrs = [], children = [{xmlcdata, <<"Error! Invalid PlayerId.">>}]});
+	Player ->
+	    game_utils:send_result_stanza(Stanza),
+	    Players = lists:filter(fun(PL) -> 
+					   PL#player.id == Sender
+				   end, State#state.players),
+	    send_game_info(State, Players),
+	    NewState = State,
+	    Timeout =  game_utils:calculate_timeout(State#state.timer_expire_time)		
+    end,
+    {NewState, Timeout};
+
+
+my_handle_cast({dice_roll, Stanza, SubEl}, State) ->
+    Sender = jid:to_string(xmpp:get_from(Stanza)),
+    if State#state.game_state =/= 'awaiting_dice_roll' ->
+	    Timeout = game_utils:calculate_timeout(State#state.timer_expire_time),
+            NewState = State,
+            game_utils:send_error_stanza(Stanza, #xmlel{name = <<"error">>, attrs = [], children = [{xmlcdata, <<"Error! Invalid Stanza.">>}]});
+       State#state.current_turn =/= Sender ->	    
+	    Timeout = game_utils:calculate_timeout(State#state.timer_expire_time),
+	    NewState = State,
+	    game_utils:send_error_stanza(Stanza, #xmlel{name = <<"error">>, attrs = [], children = [{xmlcdata, <<"Error! Not your turn.">>}]});
+       true ->
+	    DiceVal = rand:uniform(6),
+	    DiceValEl = #xmlel{name = <<"dice_val">>, attrs = [], children = [{xmlcdata, integer_to_binary(DiceVal)}]},
+	    game_utils:send_result_stanza(Stanza),
+	    
+	    Player = lists:keyfind(State#state.current_turn, #player.id, State#state.players),
+
+	    MovablePawns = get_movable_pawns(Player, DiceVal),
+	    if length(MovablePawns) == 0 ->
+		    NextTurnID = get_next_player(State),
+		    NewState = State#state{current_turn=NextTurnID, game_state='player_turn'},
+		    Timeout = 100;
+	       true ->
+		    NewState = State#state{current_dice_val=DiceVal, game_state='awaiting_pawn_move'},
+		    Timeout = game_utils:calculate_timeout(State#state.timer_expire_time)
+	    end,
+	    FromJID = game_utils:make_jid(State#state.id),
+            QueryEl = #xmlel{name = <<"query">>, attrs = [], children = [DiceValEl]},
+            QueryEl1 = game_utils:set_namespace(QueryEl, ?NS_PLAYER_DICE_ROLL),
+            Id = game_utils:get_iq_id(FromJID, ?NS_PLAYER_DICE_ROLL),
+
+            game_utils:broadcast_stanza(State#state.players, Id, FromJID, 'set', [QueryEl1])
+	   
+    end,
+    {NewState, Timeout};
+
+
+my_handle_cast({pawn_move, Stanza, SubEl}, State) ->
+    Sender = jid:to_string(xmpp:get_from(Stanza)),
+    if State#state.game_state =/= 'awaiting_pawn_move' ->
+	    ?WARNING_MSG("in pawn move E1 ~n~n~n~n~n~n", []),
+	    Timeout = game_utils:calculate_timeout(State#state.timer_expire_time),
+            NewState = State,
+            game_utils:send_error_stanza(Stanza, #xmlel{name = <<"error">>, attrs = [], children = [{xmlcdata, <<"Error! Invalid Stanza.">>}]});
+       State#state.current_turn =/= Sender ->	    
+	    ?WARNING_MSG("in pawn move E2 ~n~n~n~n~n~n", []),
+	    Timeout = game_utils:calculate_timeout(State#state.timer_expire_time),
+	    NewState = State,
+	    game_utils:send_error_stanza(Stanza, #xmlel{name = <<"error">>, attrs = [], children = [{xmlcdata, <<"Error! Not your turn.">>}]});
+       true ->
+	    game_utils:send_result_stanza(Stanza),
+	    PawnId = game_utils:get_element(SubEl, <<"pawn_id">>),
+	    DiceVal = State#state.current_dice_val,
+	    Player = lists:keyfind(State#state.current_turn, #player.id, State#state.players),
+	    case get_pawn_position(Player, PawnId, DiceVal) of
+		error ->
+		    ?WARNING_MSG("in pawn move E3 ~n~n~n~n~n~n", []),
+		    NewState = State,
+		    Timeout = game_utils:calculate_timeout(State#state.timer_expire_time),
+		    game_utils:send_error_stanza(Stanza, #xmlel{name = <<"error">>, attrs = [], children = [{xmlcdata, <<"Error! Invalid Move.">>}]});
+		{NewPlayer, Cell, SCell, CellRange} ->
+
+		    CellEl = #xmlel{name = <<"cell_val">>, attrs = [], children = [{xmlcdata, Cell}]},
+		    CellRangeEl = #xmlel{name = <<"cell_range">>, attrs = [], children = [{xmlcdata, CellRange}]},
+		    PawnEl = #xmlel{name = <<"pawn_id">>, attrs = [], children = [{xmlcdata, PawnId}]},
+		    PawnPlayerIndexEl = #xmlel{name = <<"player_index">>, attrs = [], children = [{xmlcdata, integer_to_binary(NewPlayer#player.index)}]},
+		    
+		    FromJID = game_utils:make_jid(State#state.id),
+		    ?WARNING_MSG("printing range cell @@@@@@@@@@@@@@@@@@@ ~p~n~n~n~n~n", [CellRange]),
+		    QueryEl = #xmlel{name = <<"query">>, attrs = [], children = [CellEl, PawnEl, PawnPlayerIndexEl, CellRangeEl]}, 
+		    QueryEl1 = game_utils:set_namespace(QueryEl, ?NS_PLAYER_PAWN_MOVE),
+		    Id = game_utils:get_iq_id(FromJID, ?NS_PLAYER_PAWN_MOVE),
+		    
+		    game_utils:broadcast_stanza(State#state.players, Id, FromJID, 'set', [QueryEl1]),
+
+		    NewPlayers = lists:keystore(NewPlayer#player.id, #player.id, State#state.players, NewPlayer),
+		    
+		    {NewPlayers1, CollisionPawn, CPlayer, CVal} = check_for_collision(NewPlayers, SCell, NewPlayer#player.id),
+		    
+		    if DiceVal == 6 andalso SCell == 1 ->
+			    Timeout1 = ?PAWN_MOVE_TIME;
+		       true ->
+			    Timeout1 = ?PAWN_MOVE_TIME * DiceVal
+		    end,
+
+		    if CollisionPawn =/= false->
+			    CollisionRange = list_to_binary(lists:foldl(fun(X, AccIn) ->  
+										if (AccIn == "") ->
+											AccIn ++ integer_to_list(X);
+										   true ->
+											AccIn ++ "," ++ integer_to_list(X)
+										end
+									end, "", lists:seq(CVal -1, 1, -1))),
+			    ?WARNING_MSG("~n~n~n~n !!!!!!!!!!!!!! check for collision result ~p~n~n~n~n~n", [{CollisionRange}]),
+			    CollisionRangeEl = #xmlel{name = <<"collision_range">>, attrs = [], children = [{xmlcdata, CollisionRange}]},
+			    CPlayerIdEl = #xmlel{name = <<"player_id">>, attrs = [], children = [{xmlcdata, CPlayer#player.id}]},
+			    CPlayerIndexEl = #xmlel{name = <<"player_index">>, attrs = [], children = [{xmlcdata, integer_to_binary(CPlayer#player.index)}]},
+			    CPlayerPawnEl = #xmlel{name = <<"pawn_id">>, attrs = [], children = [{xmlcdata, CollisionPawn}]},
+			    CPlayerCellEl = #xmlel{name = <<"cell_id">>, attrs = [], children = [{xmlcdata, <<"0">>}]},
+			    CQueryEl = #xmlel{name = <<"query">>, attrs = [], children = [CPlayerIdEl, CPlayerIndexEl, CPlayerPawnEl, CollisionRangeEl, CPlayerCellEl]},
+			    CQueryEl1 = game_utils:set_namespace(CQueryEl, ?NS_PLAYER_COLLISION),
+			    CId = game_utils:get_iq_id(FromJID, ?NS_PLAYER_COLLISION),
+			    Timeout2 = CVal * ?PAWN_COLLISION_TIME,
+			    
+			    game_utils:broadcast_stanza(State#state.players, CId, FromJID, 'set', [CQueryEl1]);
+		       true ->
+			    Timeout2 = 0,
+			    ok
+		    end,
+
+		    CurrentCellPawns = get_pawns_on_current_index(NewPlayers1, SCell, NewPlayer#player.index, []),
+		    if length(CurrentCellPawns) > 1 ->
+			    MQueryEl = #xmlel{name = <<"query">>, attrs = [], children = CurrentCellPawns},
+                            MQueryEl1 = game_utils:set_namespace(MQueryEl, ?NS_PLAYER_SAME_CELL),
+			    MId = game_utils:get_iq_id(FromJID, ?NS_PLAYER_SAME_CELL),
+
+                            game_utils:broadcast_stanza(State#state.players, MId, FromJID, 'set', [MQueryEl1]);
+		       true ->
+			    ok
+		    end,
+		    
+		    if DiceVal == 6 orelse Cell == <<"h6">>->
+			    NextTurnID = State#state.current_turn;
+		       CollisionPawn =/= false ->
+			    NextTurnID = State#state.current_turn;
+		       true ->
+			    NextTurnID = get_next_player(State)
+		    end,
+		    
+		    Timeout = Timeout1 + Timeout2,
+		    
+		    
+		    
+		    Winner = check_for_winner(NewPlayer),
+		    ?WARNING_MSG("~n~n~n~n~n Logging timeouts on pawn move ~p~n~n~n~n~n", [{DiceVal, SCell, Timeout, Timeout1, Timeout2}]),
+		    if (Winner == true) ->
+			    NewState = State#state{players = NewPlayers1, current_turn=NextTurnID, game_state='declare_result', winner_id=NewPlayer#player.id};
+		       true ->
+			    NewState = State#state{players = NewPlayers1, current_turn=NextTurnID, game_state='player_turn'}
+		    end
+			
+	    end
+    end,
+    {NewState, Timeout};
+
+
+
+my_handle_cast(_Request, State) ->
+    ?WARNING_MSG("in handle cast game manager ~p~n~n~n~n", [_Request]),
+    Timeout = game_utils:calculate_timeout(State#state.timer_expire_time),
+    {State, Timeout}.
+    
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc
+%% Handling all non call/cast messages
+%% @end
+%%--------------------------------------------------------------------
+-spec handle_info(Info :: timeout() | term(), State :: term()) ->
+	  {noreply, NewState :: term()} |
+	  {noreply, NewState :: term(), Timeout :: timeout()} |
+	  {noreply, NewState :: term(), hibernate} |
+	  {stop, Reason :: normal | term(), NewState :: term()}.
+handle_info(Info, State) ->
+    case my_handle_info(Info, State) of
+	{Newstate, terminate} ->
+	    {stop, normal, Newstate};
+	{NewState, Timeout} ->
+	    TimerTime = game_utils:timer_expire_time(Timeout),
+	    {noreply, NewState#state{timer_expire_time=TimerTime}, Timeout}
+    end.
+
+my_handle_info(timeout, State) ->
+    case State#state.game_state of
+	'send_game_info' ->
+	    NewState = send_game_info(State, all),
+	    Timeout = ?GAME_START_TIME;
+	'player_turn' ->
+	    NewState = send_player_turn_packet(State),
+            Timeout = ?STURN_TIMEOUT;
+	'awaiting_dice_roll' ->
+	    NextTurnID = get_next_player(State),
+	    NewState = State#state{current_turn=NextTurnID, game_state='player_turn'},
+	    Timeout = 0;
+	'awaiting_pawn_move' ->
+	    NextTurnID = get_next_player(State),
+            NewState = State#state{current_turn=NextTurnID, game_state='player_turn'},
+            Timeout = 0;
+	'declare_result' ->
+	    NewState2 = send_winner_stanza(State),
+	    NewPlayers = lists:map(fun(Player) -> 
+					   if Player#player.id == NewState2#state.winner_id ->
+						   Player#player{remaining_chips = Player#player.remaining_chips + NewState2#state.pot_amount};
+					      true ->
+						   Player
+					   end
+				   end, NewState2#state.players),
+	    NewState = NewState2#state{players=NewPlayers},
+	    Timeout = 0;
+	'terminate_game' ->
+	    NewState = State,
+	    Timeout = terminate;
+	_ ->
+	    NewState = State,
+	    Timeout = game_utils:calculate_timeout(State#state.timer_expire_time)
+    end,
+    {NewState, Timeout};
+
+
+my_handle_info(_Info, State) ->
+    Timeout = game_utils:calculate_timeout(State#state.timer_expire_time),
+    {State, Timeout}.
+%%--------------------------------------------------------------------
+%% @private
+%% @doc
+%% This function is called by a gen_server when it is about to
+%% terminate. It should be the opposite of Module:init/1 and do any
+%% necessary cleaning up. When it returns, the gen_server terminates
+%% with Reason. The return value is ignored.
+%% @end
+%%--------------------------------------------------------------------
+-spec terminate(Reason :: normal | shutdown | {shutdown, term()} | term(),
+		State :: term()) -> any().
+terminate(_Reason, State) ->
+    ?WARNING_MSG("~n~n~n~n~n~n in terminate game ~p~n~n~n~n", [{}]),
+    delete_redis_active_game(State#state.players),
+    game_manager:close_table(State#state.id),
+    lists:foreach(fun(Player) -> 
+			  game_queries:update_user_chips(?LSERVER, Player#player.jid, Player#player.chips, Player#player.remaining_chips, Player#player.level)
+		  end, State#state.players),
+    
+    ok.
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc
+%% Convert process state when code is changed
+%% @end
+%%--------------------------------------------------------------------
+-spec code_change(OldVsn :: term() | {down, term()},
+		  State :: term(),
+		  Extra :: term()) -> {ok, NewState :: term()} |
+	  {error, Reason :: term()}.
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc
+%% This function is called for changing the form and appearance
+%% of gen_server status when it is returned from sys:get_status/1,2
+%% or when it appears in termination error logs.
+%% @end
+%%--------------------------------------------------------------------
+-spec format_status(Opt :: normal | terminate,
+		    Status :: list()) -> Status :: term().
+format_status(_Opt, Status) ->
+    Status.
+
+%%%===================================================================
+%%% Internal functions
+%%%===================================================================
+send_game_info(State, Players1) ->
+    FromJID = game_utils:make_jid(State#state.id),
+    GameIdEl = #xmlel{name = <<"game_id">>, attrs = [], children = [{xmlcdata, State#state.id}]},
+    TLevelEl = #xmlel{name = <<"level">>, attrs = [], children = [{xmlcdata, integer_to_binary(State#state.level)}]},
+    PotAmountlEl = #xmlel{name = <<"pot_amount">>, attrs = [], children = [{xmlcdata, integer_to_binary(State#state.pot_amount)}]},
+    GameStartTimeEL = #xmlel{name = <<"game_start_time">>, attrs = [], children = [{xmlcdata, integer_to_binary(?GAME_START_TIME)}]},
+    PawnCollisionTimeEl = #xmlel{name = <<"pawn_cat">>, attrs = [], children = [{xmlcdata, integer_to_binary(?PAWN_COLLISION_TIME)}]},
+    PawnMoveTimeEl = #xmlel{name = <<"pawn_mat">>, attrs = [], children = [{xmlcdata, integer_to_binary(?PAWN_MOVE_TIME)}]},
+    
+    RemTime = game_utils:calculate_timeout(State#state.timer_expire_time),
+    
+    RemTimeoutEl = #xmlel{name = <<"rem_turn_time">>, attrs = [], children = [{xmlcdata, integer_to_binary(RemTime - ?TURN_DIFF)}]},
+    TurnTimeoutEl = #xmlel{name = <<"turn_time">>, attrs = [], children = [{xmlcdata, integer_to_binary(?CTURN_TIMEOUT)}]},
+    if State#state.game_state == 'awaiting_dice_roll' ->
+	    IsRollingEl = #xmlel{name = <<"is_rolling">>, attrs = [], children = [{xmlcdata, <<"true">>}]};
+       true ->
+	    IsRollingEl	= #xmlel{name = <<"is_rolling">>, attrs = [], children = [{xmlcdata, <<"false">>}]}
+    end,
+    if State#state.game_state == 'awaiting_pawn_move' ->
+	    MovePawnEl = #xmlel{name = <<"move_pawn">>, attrs = [], children = [{xmlcdata, <<"true">>}]};
+       true ->
+	    MovePawnEl	= #xmlel{name = <<"move_pawn">>, attrs = [], children = [{xmlcdata, <<"false">>}]}
+    end,
+    CurrentPlayer = lists:keyfind(State#state.current_turn, #player.id, State#state.players),
+    TurnIdEl = #xmlel{name = <<"turn_player_id">>, attrs = [], children = [{xmlcdata, State#state.current_turn}]},
+    TurnIndexEl = #xmlel{name = <<"turn_player_index">>, attrs = [], children = [{xmlcdata, integer_to_binary(CurrentPlayer#player.index)}]},
+    Players = lists:map(fun(Player) -> 
+				ImageEl = #xmlel{name = <<"imageUrl">>, attrs = [], children = [{xmlcdata, Player#player.image_url}]},
+				NameEl = #xmlel{name = <<"name">>, attrs = [], children = [{xmlcdata, Player#player.name}]},
+				ChipsEl = #xmlel{name = <<"chips">>, attrs = [], children = [{xmlcdata, integer_to_binary(Player#player.chips)}]},
+				IdEl = #xmlel{name = <<"id">>, attrs = [], children = [{xmlcdata, Player#player.id}]},
+				LevelEl = #xmlel{name = <<"level">>, attrs = [], children = [{xmlcdata, integer_to_binary(Player#player.level)}]},
+				IndexEl = #xmlel{name = <<"index">>, attrs = [], children = [{xmlcdata, integer_to_binary(Player#player.index)}]},
+				%% DeltaEl = #xmlel{name = <<"delta">>, attrs = [], children = [{xmlcdata, Player#player.delta}]},
+				Markers = lists:map(fun({MKey, MVal}) -> 
+							    if MVal > 51 ->
+								    Diff = MVal - 51,
+								    MVal1 = list_to_binary("h" ++ integer_to_list(Diff));
+							       true ->
+								    MVal1 = integer_to_binary(MVal)
+							    end,
+							    MKeyEl = #xmlel{name = <<"key">>, attrs = [], children = [{xmlcdata, MKey}]},
+							    MValEl = #xmlel{name = <<"val">>, attrs = [], children = [{xmlcdata, MVal1}]},
+							    #xmlel{name = <<"marker">>, attrs = [], children = [MKeyEl, MValEl]}
+						    end, Player#player.markers),
+				MarkersEl = #xmlel{name = <<"markers">>, attrs = [], children = Markers},
+				PlayerEl = #xmlel{name = <<"player">>, attrs = [], children = [ImageEl, NameEl, ChipsEl, IdEl, LevelEl, IndexEl, MarkersEl]}
+			end, State#state.players),
+    PlayersEl = #xmlel{name = <<"players">>, attrs = [], children = Players},
+    QueryEl = #xmlel{name = <<"query">>, attrs = [], children = [GameIdEl, TLevelEl, GameStartTimeEL, TurnTimeoutEl, PlayersEl, IsRollingEl, MovePawnEl, TurnIdEl, TurnIndexEl, RemTimeoutEl, PotAmountlEl, PawnCollisionTimeEl, PawnMoveTimeEl]},
+    QueryEl1 = game_utils:set_namespace(QueryEl, ?NS_GAME_INFO),
+    
+    Id = game_utils:get_iq_id(FromJID, ?NS_GAME_INFO),
+    if Players1 == all ->
+	    game_utils:broadcast_stanza(State#state.players, Id, FromJID, 'set', [QueryEl1]);
+       true ->
+	    game_utils:broadcast_stanza(Players1, Id, FromJID, 'set', [QueryEl1])
+    end,
+    %%    NewState = State#state{current_turn=P1#player.id, game_state='player_turn'},
+    NewState = State#state{game_state='player_turn'},
+    NewState.
+
+send_player_turn_packet(State)->
+    FromJID = game_utils:make_jid(State#state.id),
+    Player = lists:keyfind(State#state.current_turn, #player.id, State#state.players),
+    PlayerIndexEl = #xmlel{name = <<"turn_player_index">>, attrs = [], children = [{xmlcdata, integer_to_binary(Player#player.index)}]},
+    PlayerIdEl = #xmlel{name = <<"turn_player_id">>, attrs = [], children = [{xmlcdata, State#state.current_turn}]},
+    TurnTimeoutEl = #xmlel{name = <<"turn_time">>, attrs = [], children = [{xmlcdata, integer_to_binary(?CTURN_TIMEOUT)}]},
+    %%MarkerEl = #xmlel{name = <<"marker">>, attrs = [], children = [{xmlcdata, Player#player.markers}]},
+    QueryEl = #xmlel{name = <<"query">>, attrs = [], children = [PlayerIdEl, TurnTimeoutEl, PlayerIndexEl]},
+    QueryEl1 = game_utils:set_namespace(QueryEl, ?NS_GAME_PLAYERTURN),
+    
+    Id = game_utils:get_iq_id(FromJID, ?NS_GAME_PLAYERTURN),
+    game_utils:broadcast_stanza(State#state.players, Id, FromJID, 'set', [QueryEl1]),
+    NewState = State#state{game_state='awaiting_dice_roll'},	
+    NewState.
+    
+send_winner_stanza(State) ->
+    FromJID = game_utils:make_jid(State#state.id),
+    WinnerIdEl = #xmlel{name = <<"winner_player_id">>, attrs = [], children = [{xmlcdata, State#state.winner_id}]},
+    WinChipsEl = #xmlel{name = <<"win_chips">>, attrs = [], children = [{xmlcdata, integer_to_binary(State#state.pot_amount)}]},
+    QueryEl = #xmlel{name = <<"query">>, attrs = [], children = [WinnerIdEl, WinChipsEl]},
+    QueryEl1 = game_utils:set_namespace(QueryEl, ?NS_GAME_RESULT),
+    Id = game_utils:get_iq_id(FromJID, ?NS_GAME_RESULT),
+    game_utils:broadcast_stanza(State#state.players, Id, FromJID, 'set', [QueryEl1]),
+    NewState = State#state{game_state='terminate_game'},
+    NewState.
+
+
+delete_redis_active_game(Players)->
+    lists:map(fun(PL) -> 
+                      Key = <<(PL#player.id)/binary, ?ACTIVE_GAME_KEY/binary>>,
+		      eredis_pooler:q(?REDIS_POOL, ["DEL", Key])
+              end, Players).
+
+
+set_redis_active_game(Players, Id) ->
+    lists:map(fun(PL) -> 
+                      Key = <<(PL#player.id)/binary, ?ACTIVE_GAME_KEY/binary>>,
+                      eredis_pooler:q(?REDIS_POOL, ["SET", Key, Id])
+              end, Players).
+
+get_pawn_position(Player, PawnId, DiceVal) ->
+    Markers = Player#player.markers,
+    case lists:keyfind(PawnId, 1, Markers) of
+	{PawnId, Cell} ->
+	    if Cell == 0 andalso DiceVal == 6 ->
+		    NewVal = 1,
+		    NewMarkers = lists:keystore(PawnId, 1, Markers, {PawnId, NewVal}),
+		    NewPlayer = Player#player{markers=NewMarkers},
+		    {NewPlayer, integer_to_binary(NewVal), NewVal, integer_to_binary(NewVal)};
+	       Cell =/= 0 andalso (Cell + DiceVal) =< 51 ->
+		    NewVal = Cell + DiceVal,
+		    NewMarkers = lists:keystore(PawnId, 1, Markers, {PawnId, NewVal}),
+		    NewPlayer = Player#player{markers=NewMarkers},
+		    CellRange = lists:seq(Cell + 1, NewVal),
+		    CellRange1 = list_to_binary(lists:foldl(fun(X, AccIn) -> 
+								    if AccIn == "" ->
+									    AccIn ++ integer_to_list(X);
+								       true ->
+									    AccIn ++ "," ++ integer_to_list(X)
+								    end
+					     end, "", CellRange)),
+                    {NewPlayer, integer_to_binary(NewVal), NewVal, CellRange1};
+	       Cell =/= 0 andalso (Cell + DiceVal) > 51 ->
+		    NewVal = Cell + DiceVal,
+		    if NewVal < 58 ->
+			    NewMarkers = lists:keystore(PawnId, 1, Markers, {PawnId, NewVal}),
+			    NewPlayer = Player#player{markers=NewMarkers},
+			    NewVal1 = list_to_binary("h" ++ integer_to_list(NewVal - 51)),
+			    CellRange =	lists:seq(Cell + 1, NewVal),
+			    ?WARNING_MSG("printing cell range in last case ########### ~p~n~n~n~n~n", [{Cell + 1, NewVal, CellRange}]),
+			    CellRange1 = list_to_binary(lists:foldl(fun(X, AccIn) ->
+									    if X < 52 ->
+										    if AccIn ==	"" ->
+											    AccIn ++ integer_to_list(X);
+										       true ->
+											    AccIn ++ "," ++ integer_to_list(X)
+										    end;
+									       true ->
+										    if AccIn == "" ->
+                                                                                            AccIn ++ "h" ++ integer_to_list(X - 51);
+                                                                                       true ->
+											    AccIn ++ "," ++ "h" ++ integer_to_list(X - 51)
+										    end
+									    end
+								    end, "", CellRange)),
+			    {NewPlayer, NewVal1, NewVal, CellRange1};
+		       true ->
+			    error
+		    end;
+	       true ->
+		    error
+	    end;
+	_  ->
+	    error
+    end.
+
+get_movable_pawns(Player, DiceVal) ->
+    lists:foldl(fun({PawnId, _}, AccIn) -> 
+			case get_pawn_position(Player, PawnId, DiceVal) of
+			    error ->
+				AccIn;
+			    _ ->
+				AccIn ++ [PawnId]
+			end
+		end, [], Player#player.markers).
+
+
+get_next_turn_id(CurrIndex, Players) ->
+    NewIndex = CurrIndex + 1,
+    if NewIndex > 4 ->
+	    NewIndex1 = 1;
+       true ->
+	    NewIndex1 = NewIndex
+    end,
+    case lists:keyfind(NewIndex1, #player.index, Players) of
+	false ->
+	    get_next_turn_id(NewIndex1, Players);
+	Player ->
+	    Player#player.id
+    end.
+
+get_next_player(State) ->
+    CurrentTurn = State#state.current_turn,
+    CurrentPlayer = lists:keyfind(CurrentTurn, #player.id, State#state.players),
+    CurrentIndex = CurrentPlayer#player.index,
+    get_next_turn_id(CurrentIndex, State#state.players).
+
+
+check_for_winner(Player) ->
+    HomeList = lists:all(fun({_, Val}) -> 
+				 Val == 57
+			 end, Player#player.markers).
+
+
+check_collision(Player, Cell, CurrentIndex) ->
+    Pawns = Player#player.markers,
+    
+    lists:foldl(fun({PawnId, Val1}, AccIn) ->
+			if  Val1 < 52 andalso Val1 =/= 0->				
+				Delta = erlang:abs((52 - erlang:abs(Player#player.index - CurrentIndex) * 13)),
+				Val2 = Val1 + Delta,
+				if(Val2 > 52) ->
+					Val = erlang:abs(Val2 - 52);
+				  true ->
+					Val = Val2
+				end,
+				if Val == Cell ->
+					AccIn ++ [{PawnId, Val1}];
+				   true ->
+					AccIn
+				end;
+			   true ->
+				AccIn
+			end
+		end, [], Pawns).
+
+check_for_collision(Players, Cell, CurentPlayerId) ->
+    if (Cell > 51) ->
+	    {Players, false, false, false};
+       true ->
+	    case lists:member(Cell, ?COLLISION_FREE_CELLS) of
+		true ->
+		    {Players, false, false, false};
+		_ ->
+		    TurnPlayer = lists:keyfind(CurentPlayerId, #player.id, Players),
+		    RemPlayers = lists:filter(fun(Player) -> 
+						      Player#player.id =/= CurentPlayerId
+					      end, Players),
+
+
+		    CollisionMap = lists:map(fun(Player) ->
+						     Pawns = check_collision(Player, Cell, TurnPlayer#player.index),
+						     {Player#player.id, Pawns}
+					     end, RemPlayers),
+		    ?WARNING_MSG("~n~n~n~n~n ######## IN CHECK FOR CLOOISION ~p~n~n~n~n", [{Cell, CurentPlayerId, CollisionMap}]),
+		    if length(CollisionMap) == 0 ->
+			    {Players, false, false, false};
+		       true ->
+			    Res =  lists:foldl(fun({PID, Pawns}, AccIn) -> 
+						       if length(Pawns) == 1 ->							       
+							       {PID, lists:nth(1, Pawns)};
+							  true  ->
+							       AccIn
+						       end
+					       end, {}, CollisionMap),
+			    case Res of
+				{} ->
+				    {Players, false, false, false};
+				{PlayerId, {PawnId, Val}} ->
+				    CPlayer = lists:keyfind(PlayerId, #player.id, Players),
+				    PlayerPawns = lists:keystore(PawnId, 1, CPlayer#player.markers, {PawnId, 0}),
+				    NewPlayer = CPlayer#player{markers=PlayerPawns},
+				    NewPlayers = lists:keystore(PlayerId, #player.id, Players, NewPlayer),
+				    {NewPlayers, PawnId, CPlayer, Val};
+				_ ->
+				    {Players, false, false, false}
+			    end
+		    end
+	    end
+    end.
+
+
+get_pawns_player_index(Player, Cell, CurrentIndex, MarkersArray) ->
+    Pawns = Player#player.markers,
+    
+    
+    lists:foldl(fun({PawnId, Val1}, AccIn) ->
+			Delta = erlang:abs((52 - erlang:abs(Player#player.index - CurrentIndex) * 13)),
+			Val2 = Val1 + Delta,
+			if(Val2 > 52) ->
+				Val = erlang:abs(Val2 - 52);
+			  true ->
+				Val = Val2
+			end,
+			if Val1 == 0 ->
+				AccIn;
+			   Val == Cell andalso Val1 > 51 andalso CurrentIndex == Player#player.index ->
+				PawnIdEl = #xmlel{name = <<"pawn_id">>, attrs = [], children = [{xmlcdata, PawnId}]},
+                                AccIn ++ [PawnIdEl];
+			   Val == Cell andalso Val1 < 52 ->
+				PawnIdEl = #xmlel{name = <<"pawn_id">>, attrs = [], children = [{xmlcdata, PawnId}]},
+				AccIn ++ [PawnIdEl];
+			   true ->
+				AccIn
+			end
+		   
+		   end, MarkersArray, Pawns).
+
+
+get_pawns_on_current_index([Player| R], Cell, CurrentIndex, MarkersArray) ->
+    NewArr = get_pawns_player_index(Player, Cell, CurrentIndex, MarkersArray),
+    get_pawns_on_current_index(R, Cell, CurrentIndex, NewArr);
+
+get_pawns_on_current_index([], _Cell, CurrentIndex, MarkersArray) ->
+    MarkersArray.

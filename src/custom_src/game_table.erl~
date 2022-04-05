@@ -1,0 +1,388 @@
+%%%-------------------------------------------------------------------stop
+%%% @author Nayan Jain <nayanjain>
+%%% @copyright (C) 2020, Nayan Jain
+%%% @doc
+%%%
+%%% @end
+%%% Created :  9 Feb 2020 by Nayan Jain <nayanjain>
+%%%-------------------------------------------------------------------
+-module(game_table).
+
+-behaviour(gen_server).
+
+
+
+-include("logger.hrl").
+-include("xmpp.hrl").
+-include("mygame.hrl").
+-include("namespaces.hrl").
+%% API
+-export([start_link/1]).
+
+%% gen_server callbacks
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2,
+	 terminate/2, code_change/3, format_status/2]).
+
+-define(SERVER, ?MODULE).
+
+-record(state, {id, level, players, current_turn, timer_expire_time, game_state, markers}).
+
+%%%===================================================================
+%%% API
+%%%===================================================================
+
+%%--------------------------------------------------------------------
+%% @doc
+%% Starts the server
+%% @end
+%%--------------------------------------------------------------------
+start_link(Opts) ->
+    ?WARNING_MSG("in game table start link 5555555 ~p~n~n~n" , [Opts]),
+    gen_server:start_link(?MODULE, Opts, []).
+
+%%%===================================================================
+%%% gen_server callbacks
+%%%===================================================================
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc
+%% Initializes the server
+%% @end
+%%--------------------------------------------------------------------
+-spec init(Args :: term()) -> {ok, State :: term()} |
+	  {ok, State :: term(), Timeout :: timeout()} |
+	  {ok, State :: term(), hibernate} |
+	  {stop, Reason :: term()} |
+	  ignore.
+init([P1, P2, Level, Id]) ->
+    ?WARNING_MSG("in game table init 5555555", []),
+    SID={os:timestamp(), self()},
+    random:seed(os:timestamp()),
+    game_manager:open_table(Id, self(), SID, custom),
+    ?WARNING_MSG("in game table init 5555555111111", []),
+    Players = [P1#player{marker= <<"X">>}, P2#player{marker= <<"O">>}],
+    set_redis_active_game(Players, Id),
+    {ok, #state{id=Id, level=Level, players=Players, game_state='send_game_info', current_turn=P1#player.id, timer_expire_time=game_utils:timer_expire_time(?GAME_START_TIME), markers=array:new(9)}, ?GAME_START_TIME}.
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc
+%% Handling call messages
+%% @end
+%%--------------------------------------------------------------------
+-spec handle_call(Request :: term(), From :: {pid(), term()}, State :: term()) ->
+	  {reply, Reply :: term(), NewState :: term()} |
+	  {reply, Reply :: term(), NewState :: term(), Timeout :: timeout()} |
+	  {reply, Reply :: term(), NewState :: term(), hibernate} |
+	  {noreply, NewState :: term()} |
+	  {noreply, NewState :: term(), Timeout :: timeout()} |
+	  {noreply, NewState :: term(), hibernate} |
+	  {stop, Reason :: term(), Reply :: term(), NewState :: term()} |
+	  {stop, Reason :: term(), NewState :: term()}.
+handle_call(Request, From, State) ->
+    Reply = ok,
+    NewState = my_handle_call(Request, From, State),
+    Timeout = game_utils:calculate_timeout(State#state.timer_expire_time),
+    {reply, Reply, State, Timeout}.
+
+my_handle_call(_request, _From, State) ->
+    State.
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc
+%% Handling cast messages
+%% @end
+%%--------------------------------------------------------------------
+-spec handle_cast(Request :: term(), State :: term()) ->
+	  {noreply, NewState :: term()} |
+	  {noreply, NewState :: term(), Timeout :: timeout()} |
+	  {noreply, NewState :: term(), hibernate} |
+	  {stop, Reason :: term(), NewState :: term()}.
+handle_cast(Request, State) ->
+    {NewState, Timeout} = my_handle_cast(Request, State),
+    {noreply, NewState, Timeout}.
+
+my_handle_cast({player_quit, Stanza, SubEl}, State) ->
+    Sender = jid:to_string(xmpp:get_from(Stanza)),
+    case lists:keyfind(Sender, #player.id, State#state.players) of
+	false ->
+	    NewState = State,
+	    Timeout =  game_utils:calculate_timeout(State#state.timer_expire_time),
+	    game_utils:send_error_stanza(Stanza, #xmlel{name = <<"error">>, attrs = [], children = [{xmlcdata, <<"Error! Invalid Stanza.">>}]});
+	Player ->
+	    game_utils:send_result_stanza(Stanza),
+	    delete_redis_active_game([lists:keyfind(Sender, #player.id, State#state.players)]),
+	    Players = lists:filter(fun(PL) -> 
+					   PL#player.id =/= Sender
+				   end, State#state.players),
+	    State1 = State#state{players=Players},
+	    
+	    NewState = send_winner_stanza(lists:nth(1, Players), [], State1),
+	    Timeout = ?RESULT_TIMEOUT
+    end,
+    {NewState, Timeout};
+
+
+my_handle_cast({send_game_info, Stanza, SubEl}, State) ->
+    Sender = jid:to_string(xmpp:get_from(Stanza)),
+    case lists:keyfind(Sender, #player.id, State#state.players) of
+	false ->
+	    NewState = State,
+	    Timeout =  game_utils:calculate_timeout(State#state.timer_expire_time),
+	    game_utils:send_error_stanza(Stanza, #xmlel{name = <<"error">>, attrs = [], children = [{xmlcdata, <<"Error! Invalid PlayerId.">>}]});
+	Player ->
+	    game_utils:send_result_stanza(Stanza),
+	    Players = lists:filter(fun(PL) -> 
+					   PL#player.id == Sender
+				   end, State#state.players),
+	    send_game_info(State, Players),
+	    NewState = State,
+	    Timeout =  game_utils:calculate_timeout(State#state.timer_expire_time)		
+    end,
+    {NewState, Timeout};
+
+
+my_handle_cast({player_response, Stanza, SubEl}, State) ->
+    Sender = jid:to_string(xmpp:get_from(Stanza)),
+    if State#state.game_state =/= 'awaiting_turn_response' ->
+	    Timeout = game_utils:calculate_timeout(State#state.timer_expire_time),
+            NewState = State,
+            game_utils:send_error_stanza(Stanza, #xmlel{name = <<"error">>, attrs = [], children = [{xmlcdata, <<"Error! Invalid Stanza.">>}]});
+	State#state.current_turn =/= Sender ->	    
+	    Timeout = game_utils:calculate_timeout(State#state.timer_expire_time),
+	    NewState = State,
+	    game_utils:send_error_stanza(Stanza, #xmlel{name = <<"error">>, attrs = [], children = [{xmlcdata, <<"Error! Not your turn.">>}]});
+       true ->
+	    game_utils:send_result_stanza(Stanza),
+	    BlockId = game_utils:get_element(SubEl, <<"block_id">>),
+
+	    if BlockId =/= <<"">> ->
+		    ArrInd = binary_to_integer(BlockId),
+		    ?WARNING_MSG("~n~n~n printing senders and receivers in cast ~p~n~n~n~n", [{State#state.markers, ArrInd}]),
+		    case array:get(ArrInd, State#state.markers) of
+			undefined ->
+			    FromJID = game_utils:make_jid(State#state.id),
+			    Player = lists:keyfind(State#state.current_turn, #player.id, State#state.players),
+			    PlayerIdEl = #xmlel{name = <<"turn_player_id">>, attrs = [], children = [{xmlcdata, State#state.current_turn}]},
+			    BlockIdEl = #xmlel{name = <<"block_id">>, attrs = [], children = [{xmlcdata, BlockId}]},
+			    MarkerEl = #xmlel{name = <<"marker">>, attrs = [], children = [{xmlcdata, Player#player.marker}]},
+			    QueryEl = #xmlel{name = <<"query">>, attrs = [], children = [PlayerIdEl, MarkerEl, BlockIdEl]},
+			    QueryEl1 = game_utils:set_namespace(QueryEl, ?NS_GAME_PLAYER_RESPONSE),
+			    Id = game_utils:get_iq_id(FromJID, ?NS_GAME_PLAYER_RESPONSE),
+			    game_utils:broadcast_stanza_to_rest(State#state.players, Id, FromJID, 'set', [QueryEl1], State#state.current_turn),
+			    [OtherPlayer] = lists:filter(fun(Pl) -> 
+								 Pl#player.id =/= Sender
+								     
+							 end, State#state.players),
+			    UpdatedMarkers = array:set(ArrInd, Player#player.marker, State#state.markers),
+			    case game_utils:check_for_winner(UpdatedMarkers) of
+				{true, WinnerCombo, Marker} ->
+				    Winner = lists:keyfind(Marker, #player.marker, State#state.players),
+				    State1 = State#state{markers=UpdatedMarkers},
+				    NewState = send_winner_stanza(Winner, WinnerCombo, State1),
+				    Timeout = ?RESULT_TIMEOUT;
+				_ ->				    
+				    State1 = State#state{current_turn=OtherPlayer#player.id, markers=UpdatedMarkers},
+				    NewState = send_player_turn_packet(State1),
+				    Timeout = ?STURN_TIMEOUT
+			    end;
+			_ ->
+			    NewState = State,
+			    Timeout = game_utils:calculate_timeout(State#state.timer_expire_time),
+			    game_utils:send_error_stanza(Stanza, #xmlel{name = <<"error">>, attrs = [], children = [{xmlcdata, <<"Error! Invalid Input.">>}]})
+		    end;
+	       true  ->
+		    NewState = State,
+		    Timeout = game_utils:calculate_timeout(State#state.timer_expire_time),
+		    game_utils:send_error_stanza(Stanza, #xmlel{name = <<"error">>, attrs = [], children = [{xmlcdata, <<"Error! Invalid Input.">>}]})
+	    end
+    end,
+    {NewState, Timeout};
+
+
+my_handle_cast(_Request, State) ->
+    ?WARNING_MSG("in handle cast game manager ~p~n~n~n~n", [_Request]),
+    Timeout = game_utils:calculate_timeout(State#state.timer_expire_time),
+    {State, Timeout}.
+    
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc
+%% Handling all non call/cast messages
+%% @end
+%%--------------------------------------------------------------------
+-spec handle_info(Info :: timeout() | term(), State :: term()) ->
+	  {noreply, NewState :: term()} |
+	  {noreply, NewState :: term(), Timeout :: timeout()} |
+	  {noreply, NewState :: term(), hibernate} |
+	  {stop, Reason :: normal | term(), NewState :: term()}.
+handle_info(Info, State) ->
+    case my_handle_info(Info, State) of
+	{Newstate, terminate} ->
+	    {stop, normal, Newstate};
+	{NewState, Timeout} ->
+	    {noreply, NewState, Timeout}
+    end.
+
+my_handle_info(timeout, State) ->
+    case State#state.game_state of
+	'send_game_info' ->
+	    NewState = send_game_info(State, all),
+	    Timeout = ?GAME_START_TIME;
+	'player_turn' ->
+	    NewState = send_player_turn_packet(State),
+            Timeout = ?STURN_TIMEOUT;
+	'awaiting_turn_response' ->
+	    [OtherPlayer] = lists:filter(fun(Pl) -> 
+                                                 Pl#player.id =/= State#state.current_turn
+                                         end, State#state.players),
+	    
+            State1 = State#state{current_turn=OtherPlayer#player.id},
+            NewState = send_player_turn_packet(State1),
+	    Timeout = ?STURN_TIMEOUT;
+	'terminate_game' ->
+	    NewState = State,
+	    Timeout = terminate;
+	_ ->
+	    NewState = State,
+	    Timeout = game_utils:calculate_timeout(State#state.timer_expire_time)
+    end,
+    {NewState, Timeout};
+
+
+my_handle_info(_Info, State) ->
+    Timeout = game_utils:calculate_timeout(State#state.timer_expire_time),
+    {State, Timeout}.
+%%--------------------------------------------------------------------
+%% @private
+%% @doc
+%% This function is called by a gen_server when it is about to
+%% terminate. It should be the opposite of Module:init/1 and do any
+%% necessary cleaning up. When it returns, the gen_server terminates
+%% with Reason. The return value is ignored.
+%% @end
+%%--------------------------------------------------------------------
+-spec terminate(Reason :: normal | shutdown | {shutdown, term()} | term(),
+		State :: term()) -> any().
+terminate(_Reason, State) ->
+    delete_redis_active_game(State#state.players),
+    ok.
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc
+%% Convert process state when code is changed
+%% @end
+%%--------------------------------------------------------------------
+-spec code_change(OldVsn :: term() | {down, term()},
+		  State :: term(),
+		  Extra :: term()) -> {ok, NewState :: term()} |
+	  {error, Reason :: term()}.
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc
+%% This function is called for changing the form and appearance
+%% of gen_server status when it is returned from sys:get_status/1,2
+%% or when it appears in termination error logs.
+%% @end
+%%--------------------------------------------------------------------
+-spec format_status(Opt :: normal | terminate,
+		    Status :: list()) -> Status :: term().
+format_status(_Opt, Status) ->
+    Status.
+
+%%%===================================================================
+%%% Internal functions
+%%%===================================================================
+send_game_info(State, Players1) ->
+    FromJID = game_utils:make_jid(State#state.id),
+    GameIdEl = #xmlel{name = <<"game_id">>, attrs = [], children = [{xmlcdata, State#state.id}]},
+    TLevelEl = #xmlel{name = <<"level">>, attrs = [], children = [{xmlcdata, integer_to_binary(State#state.level)}]},
+    GameStartTimeEL = #xmlel{name = <<"game_start_time">>, attrs = [], children = [{xmlcdata, integer_to_binary(?GAME_START_TIME)}]},
+    TurnTimeoutEl = #xmlel{name = <<"turn_time">>, attrs = [], children = [{xmlcdata, integer_to_binary(?CTURN_TIMEOUT)}]},
+    Players = lists:map(fun(Player) -> 
+				ImageEl = #xmlel{name = <<"imageUrl">>, attrs = [], children = [{xmlcdata, Player#player.image_url}]},
+				NameEl = #xmlel{name = <<"name">>, attrs = [], children = [{xmlcdata, Player#player.name}]},
+				ChipsEl = #xmlel{name = <<"chips">>, attrs = [], children = [{xmlcdata, Player#player.chips}]},
+				IdEl = #xmlel{name = <<"id">>, attrs = [], children = [{xmlcdata, Player#player.id}]},
+				LevelEl = #xmlel{name = <<"level">>, attrs = [], children = [{xmlcdata, Player#player.level}]},
+				PlayerEl = #xmlel{name = <<"player">>, attrs = [], children = [ImageEl, NameEl, ChipsEl, IdEl, LevelEl]}
+			end, State#state.players),
+    PlayersEl = #xmlel{name = <<"players">>, attrs = [], children = Players},
+    MarkersDict = array:to_orddict(State#state.markers),
+    Markers = lists:map(fun({Ind, Val}) -> 
+				if Val =/= undefined ->
+					IndEl = #xmlel{name = <<"index">>, attrs = [], children = [{xmlcdata, integer_to_binary(Ind)}]},
+					ValEL = #xmlel{name = <<"value">>, attrs = [], children = [{xmlcdata, Val}]},
+					CellEl = #xmlel{name = <<"cell">>, attrs = [], children = [IndEl, ValEL]};
+				   true ->
+					IndEl = #xmlel{name = <<"index">>, attrs = [], children = [{xmlcdata, integer_to_binary(Ind)}]},
+                                        ValEL = #xmlel{name = <<"value">>, attrs = [], children = [{xmlcdata, <<"undefined">>}]},
+					CellEl = #xmlel{name = <<"cell">>, attrs = [], children = [IndEl, ValEL]}					    
+				end
+			end, MarkersDict),
+    MarkersEl = #xmlel{name = <<"markers">>, attrs = [], children = Markers},
+    QueryEl = #xmlel{name = <<"query">>, attrs = [], children = [GameIdEl, TLevelEl, GameStartTimeEL, TurnTimeoutEl, PlayersEl, MarkersEl]},
+    QueryEl1 = game_utils:set_namespace(QueryEl, ?NS_GAME_INFO),
+
+    Id = game_utils:get_iq_id(FromJID, ?NS_GAME_INFO),
+    if Players1 == all ->
+	    game_utils:broadcast_stanza(State#state.players, Id, FromJID, 'set', [QueryEl1]);
+       true ->
+	    game_utils:broadcast_stanza(Players1, Id, FromJID, 'set', [QueryEl1])
+    end,
+    P1 = lists:nth(1, State#state.players),
+    NewState = State#state{current_turn=P1#player.id, game_state='player_turn'},
+    NewState.
+
+send_player_turn_packet(State)->
+    FromJID = game_utils:make_jid(State#state.id),
+    Player = lists:keyfind(State#state.current_turn, #player.id, State#state.players),
+    PlayerIdEl = #xmlel{name = <<"turn_player_id">>, attrs = [], children = [{xmlcdata, State#state.current_turn}]},
+    TurnTimeoutEl = #xmlel{name = <<"turn_time">>, attrs = [], children = [{xmlcdata, integer_to_binary(?CTURN_TIMEOUT)}]},
+    MarkerEl = #xmlel{name = <<"marker">>, attrs = [], children = [{xmlcdata, Player#player.marker}]},
+    QueryEl = #xmlel{name = <<"query">>, attrs = [], children = [PlayerIdEl, TurnTimeoutEl, MarkerEl]},
+    QueryEl1 = game_utils:set_namespace(QueryEl, ?NS_GAME_PLAYERTURN),
+    
+    Id = game_utils:get_iq_id(FromJID, ?NS_GAME_PLAYERTURN),
+    game_utils:broadcast_stanza(State#state.players, Id, FromJID, 'set', [QueryEl1]),
+    NewState = State#state{game_state='awaiting_turn_response'},	
+    NewState.
+    
+send_winner_stanza(Winner, WinnerCombo, State) ->
+    FromJID = game_utils:make_jid(State#state.id),
+    WinnerIdEl = #xmlel{name = <<"winner_player_id">>, attrs = [], children = [{xmlcdata, Winner#player.id}]},
+    WinnerCombo1 = lists:foldl(fun(El, AccIn) -> 
+				       if AccIn == "" ->
+					       AccIn  ++ integer_to_list(El);
+					  true ->
+					       AccIn ++ ":" ++ integer_to_list(El)
+				       end
+			       end, "", WinnerCombo),
+    WinnerComboEl = #xmlel{name = <<"winner_combo">>, attrs = [], children = [{xmlcdata, list_to_binary(WinnerCombo1)}]},
+    QueryEl = #xmlel{name = <<"query">>, attrs = [], children = [WinnerIdEl, WinnerComboEl]},
+    QueryEl1 = game_utils:set_namespace(QueryEl, ?NS_GAME_RESULT),
+    Id = game_utils:get_iq_id(FromJID, ?NS_GAME_RESULT),
+    game_utils:broadcast_stanza(State#state.players, Id, FromJID, 'set', [QueryEl1]),
+    NewState = State#state{game_state='terminate_game'},
+    NewState.
+
+
+delete_redis_active_game(Players)->
+    lists:map(fun(PL) -> 
+                      Key = <<(PL#player.id)/binary, ?ACTIVE_GAME_KEY/binary>>,
+		      eredis_pooler:q(?REDIS_POOL, ["DEL", Key])
+              end, Players).
+
+
+set_redis_active_game(Players, Id) ->
+    lists:map(fun(PL) -> 
+                      Key = <<(PL#player.id)/binary, ?ACTIVE_GAME_KEY/binary>>,
+                      eredis_pooler:q(?REDIS_POOL, ["SET", Key, Id])
+              end, Players).
